@@ -1,0 +1,37 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tanstack-cloudflare-starter",
+  "main": "@tanstack/react-start/server-entry",
+  "compatibility_date": "2025-12-14",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./dist/client"
+  },
+  "observability": {
+    "enabled": true
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "starter_db",
+      // Replace with your D1 database ID from the Cloudflare dashboard
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "./drizzle/migrations",
+      "remote": false
+    }
+  ],
+  "r2_buckets": [
+    {
+      // Replace with your R2 bucket name
+      "bucket_name": "starter-storage",
+      "binding": "STORAGE",
+      "remote": false
+    }
+  ],
+  "send_email": [
+    {
+      "name": "EMAIL",
+      "remote": true
+    }
+  ]
+}
