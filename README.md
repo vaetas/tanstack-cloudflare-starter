@@ -49,49 +49,92 @@ import { Input } from "@/components/ui/input";
 
 ## API
 
-HTTP endpoints are TanStack Start **server routes** under [`src/routes/api/`](src/routes/api/). Each file exports a `createFileRoute` with `server.handlers` for the HTTP methods you support.
+The public REST API is a **versioned Hono app** with **OpenAPI 3.1** from [`@hono/zod-openapi`](https://github.com/honojs/middleware/tree/main/packages/zod-openapi). TanStack Start does not implement REST handlers directly — it only exposes two catch-all server routes that forward traffic.
 
-### Routes
+### Architecture
 
-| Path | File | Methods | Purpose |
-| --- | --- | --- | --- |
-| `/api/ping` | [`src/routes/api/ping.ts`](src/routes/api/ping.ts) | `GET` | Public liveness check (no auth) |
-| `/api/auth/*` | [`src/routes/api/auth.$.ts`](src/routes/api/auth.$.ts) | `GET`, `POST` | [better-auth](https://www.better-auth.com) HTTP API (catch-all splat) |
-
-The auth route forwards every request to `auth.handler(request)` from [`src/lib/auth.ts`](src/lib/auth.ts). That includes sign-in flows (email OTP, magic link), session lookup, and sign-out. The browser UI talks to these paths through [`authClient`](src/lib/auth-client.ts) (`createAuthClient` with the email OTP and magic link client plugins).
-
-Add more APIs by creating new files under `src/routes/api/` using the same `server.handlers` pattern as [`ping.ts`](src/routes/api/ping.ts) or `auth.$.ts`.
-
-```bash
-curl -s http://localhost:3000/api/ping
-# {"ok":true,"time":"2026-01-01T12:00:00.000Z"}
+```
+Client
+  ├─ /api/v1/*     → src/routes/api/v1.$.ts  → app.fetch()  → src/api/v1/ (Hono)
+  └─ /api/auth/*   → src/routes/api/auth.$.ts → auth.handler → src/lib/auth.ts
 ```
 
-App-specific server logic that is not a plain HTTP route can live as TanStack **server functions** under [`src/server/`](src/server/) (for example [`checkBindingsFn`](src/server/health.ts)). Those are invoked from React via `createServerFn`, not as public REST paths under `/api/*`.
+- **Define and change REST** in [`src/api/v1/`](src/api/v1/) only. Do not add new per-path files under `src/routes/api/` for REST (the `v1.$.ts` splat already covers all `/api/v1/*` paths).
+- **OpenAPI** is built automatically when Hono registers `createRoute` handlers. Fetch [`/api/v1/openapi.json`](http://localhost:3000/api/v1/openapi.json) in dev or production; browse [`/api/v1/docs`](http://localhost:3000/api/v1/docs) (Scalar). There is no separate generate step or checked-in spec file.
+- **React-only server logic** stays in [`src/server/`](src/server/) as `createServerFn` (not part of OpenAPI). Example: [`checkBindingsFn`](src/server/health.ts).
 
-### Authentication
+### Routes today
 
-Sessions are issued by better-auth after a successful OTP or magic-link sign-in. [`src/lib/auth.ts`](src/lib/auth.ts) enables two ways to send credentials on later requests:
+| Path | Defined in | Methods | Auth |
+| --- | --- | --- | --- |
+| `/api/v1/ping` | [`src/api/v1/routes/ping.ts`](src/api/v1/routes/ping.ts) | `GET` | Session cookie or Bearer |
+| `/api/v1/openapi.json` | [`src/api/v1/index.ts`](src/api/v1/index.ts) | `GET` | No |
+| `/api/v1/docs` | [`src/api/v1/index.ts`](src/api/v1/index.ts) | `GET` | No |
+| `/api/auth/*` | [`src/routes/api/auth.$.ts`](src/routes/api/auth.$.ts) | `GET`, `POST` | better-auth flows (sign-in, session) |
+
+The auth splat forwards to `auth.handler(request)` from [`src/lib/auth.ts`](src/lib/auth.ts). The browser uses [`authClient`](src/lib/auth-client.ts). Auth paths are intentionally **omitted** from the OpenAPI document.
+
+### Source layout (`src/api/v1/`)
+
+| File | Purpose |
+| --- | --- |
+| [`index.ts`](src/api/v1/index.ts) | Root app: `basePath("/api/v1")`, Bearer security scheme, `app.route("/…", subApp)`, `app.doc("/openapi.json", …)`, Scalar at `/docs`. Update `API_VERSION` when clients should track contract changes. |
+| [`schemas.ts`](src/api/v1/schemas.ts) | Shared Zod models for requests/responses. Always `import { z } from "@hono/zod-openapi"` and `.openapi("Name")` on exported objects. |
+| [`middleware/auth.ts`](src/api/v1/middleware/auth.ts) | `apiAuth` middleware — validates Better Auth session; exposes `userId` and `session` on the Hono context. |
+| [`routes/<name>.ts`](src/api/v1/routes/ping.ts) | One default-exported `OpenAPIHono` sub-app per resource area. |
+
+`basePath("/api/v1")` ensures OpenAPI `paths` keys look like `/api/v1/ping`. The document uses `servers: [{ url: "/" }]` so clients resolve against the current host.
+
+### How to add or change an endpoint
+
+1. **Model the contract** in [`schemas.ts`](src/api/v1/schemas.ts) (request body, query, params, success and error responses). Reuse [`errorResponseSchema`](src/api/v1/schemas.ts) for 401/4xx JSON bodies where appropriate.
+
+2. **Implement the sub-app** in `src/api/v1/routes/<name>.ts` (copy the pattern from [`ping.ts`](src/api/v1/routes/ping.ts)):
+   - `const subApp = new OpenAPIHono<{ Variables: ApiAuthVariables }>()`
+   - `subApp.use("*", apiAuth)` on protected resources
+   - `createRoute({ method, path: "/", tags, summary, security: [{ BearerAuth: [] }], request: { … }, responses: { … } })`
+   - `subApp.openapi(route, async (c) => { … })` — read validated input via `c.req.valid("json")`, etc.
+   - `export default subApp`
+
+3. **Mount** in [`index.ts`](src/api/v1/index.ts): `app.route("/<url-segment>", subApp)` → handlers are served at `/api/v1/<url-segment>` (plus any extra path segments on the `createRoute`).
+
+4. **Check the spec** — restart or refresh dev, open `/api/v1/docs`, confirm the new operation and schemas. No extra build target for OpenAPI.
+
+5. **Changing behavior** — edit the route handler and/or schemas; bump `API_VERSION` in `index.ts` if the change is breaking for API consumers.
+
+**Nested paths:** use `path: "/{id}"` (or deeper) in `createRoute` within the same sub-app, or mount another sub-app at `app.route("/books", booksApp)` and keep `path: "/"` for collection routes.
+
+**New API major version:** duplicate the `src/api/v1/` tree to `src/api/v2/`, set `basePath("/api/v2")`, add `src/routes/api/v2.$.ts` mirroring `v1.$.ts`.
+
+### Try it
+
+```bash
+curl -s http://localhost:3000/api/v1/ping
+# {"error":"Invalid or missing authorization token or session"}
+
+curl -s http://localhost:3000/api/v1/openapi.json | head
+# OpenAPI 3.1 JSON
+
+open http://localhost:3000/api/v1/docs
+# Scalar UI
+```
+
+### Authentication for `/api/v1/*`
+
+Sessions come from better-auth after OTP or magic-link sign-in. [`src/lib/auth.ts`](src/lib/auth.ts) supports:
 
 | Mechanism | How | Typical use |
 | --- | --- | --- |
-| **Session cookie** | `tanstackStartCookies()` sets an HTTP-only session cookie on the app origin | Browser UI, same-origin `fetch`, TanStack server functions during SSR |
-| **Bearer token** | `bearer()` plugin; send `Authorization: Bearer <token>` | Scripts, mobile apps, or other non-browser clients |
+| **Session cookie** | `tanstackStartCookies()` on the app origin | Browser, same-origin `fetch` |
+| **Bearer token** | `Authorization: Bearer <token>` (`bearer()` plugin) | Scripts, mobile, non-browser clients |
 
-To resolve the current user, read the incoming request headers and call better-auth:
+Hono routes use [`apiAuth`](src/api/v1/middleware/auth.ts) (`auth.api.getSession` on the incoming request). TanStack server functions use [`getSessionFn`](src/server/session.ts) / [`requireUserMiddleware`](src/server/session.ts) instead — same session, different entrypoint.
 
-```ts
-const session = await auth.api.getSession({ headers: request.headers });
-if (!session?.user) {
-  return new Response("Unauthorized", { status: 401 });
-}
-```
+`/api/auth/*` is not wrapped in `apiAuth`; it implements sign-in and session management.
 
-Server functions use the same check via [`getSessionFn`](src/server/session.ts) (`getRequestHeaders()` from TanStack Start). Protected functions attach [`requireUserMiddleware`](src/server/session.ts), which returns **401** with `UnauthorizedError` when there is no session (see [`checkBindingsFn`](src/server/health.ts)).
+Sign-up is disabled (`disableSignUp: true`); only pre-created users can sign in. See [Auth: email allowlist + pre-created users](#auth-email-allowlist--pre-created-users) below.
 
-`/api/auth/*` endpoints themselves implement sign-in and session management; they are not wrapped in `requireUserMiddleware`. New `/api/*` routes you add should perform a session check (or stay intentionally public) in each handler.
-
-Sign-up remains disabled (`disableSignUp: true`); only pre-created users can obtain a session. See [Auth: email allowlist + pre-created users](#auth-email-allowlist--pre-created-users) below.
+Agent-oriented summary: [`AGENTS.md`](AGENTS.md) § HTTP API.
 
 ## Setup
 
@@ -193,5 +236,6 @@ Only after **both** the Cloudflare email allowlist entry and the D1 user row exi
 - `src/lib/auth.ts` — better-auth config (email OTP + magic link)
 - `src/lib/db.ts` / `src/lib/r2.ts` — D1 middleware and R2 helper
 - `src/routes/index.tsx` — sign-in UI when logged out; home when signed in
-- `src/routes/api/` — HTTP API server routes (`auth.$.ts` → `/api/auth/*`)
+- `src/api/v1/` — **define REST here** (`index.ts`, `schemas.ts`, `middleware/`, `routes/`)
+- `src/routes/api/` — **forward only** (`v1.$.ts` → Hono, `auth.$.ts` → better-auth); do not add per-route REST files
 - `src/server/` — authenticated server functions (`session.ts`, `health.ts`)
